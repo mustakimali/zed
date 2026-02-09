@@ -94,6 +94,8 @@ pub struct BufferSearchBar {
     is_collapsed: bool,
     splittable_editor: Option<WeakEntity<SplittableEditor>>,
     _splittable_editor_subscription: Option<Subscription>,
+    cached_needs_expand: Option<bool>,
+    cached_supported_options: Option<workspace::searchable::SearchOptions>,
 }
 
 impl EventEmitter<Event> for BufferSearchBar {}
@@ -211,16 +213,6 @@ impl Render for BufferSearchBar {
             selection,
             find_in_results,
         } = self.supported_options(cx);
-
-        self.query_editor.update(cx, |query_editor, cx| {
-            if query_editor.placeholder_text(cx).is_none() {
-                query_editor.set_placeholder_text("Search…", window, cx);
-            }
-        });
-
-        self.replacement_editor.update(cx, |editor, cx| {
-            editor.set_placeholder_text("Replace with…", window, cx);
-        });
 
         let mut color_override = None;
         let match_text = self
@@ -471,7 +463,7 @@ impl Render for BufferSearchBar {
                             .when(has_collapse_button, |this| {
                                 this.pr_2()
                                     .border_r_1()
-                                    .border_color(cx.theme().colors().border_variant)
+                                    .border_color(theme_colors.border_variant)
                             })
                             .child(render_action_button(
                                 "buffer-search",
@@ -562,6 +554,10 @@ impl ToolbarItemView for BufferSearchBar {
         self.splittable_editor = None;
         self._splittable_editor_subscription = None;
 
+        // Invalidate caches when active item changes
+        self.cached_needs_expand = None;
+        self.cached_supported_options = None;
+
         self.pending_search.take();
 
         if let Some(splittable_editor) = item
@@ -636,7 +632,11 @@ impl ToolbarItemView for BufferSearchBar {
 
             let is_project_search = searchable_item_handle.supported_options(cx).find_in_results;
             self.active_searchable_item = Some(searchable_item_handle);
-            drop(self.update_matches(true, false, window, cx));
+
+            // Only update matches if search bar is visible and has a query
+            if !self.is_dismissed() && !self.query(cx).is_empty() {
+                drop(self.update_matches(true, false, window, cx));
+            }
             if self.needs_expand_collapse_option(cx) {
                 return ToolbarItemLocation::PrimaryLeft;
             } else if !self.is_dismissed() {
@@ -800,6 +800,11 @@ impl BufferSearchBar {
             .detach_and_log_err(cx);
         }
 
+        // Set placeholder text once during initialization instead of every render
+        query_editor.update(cx, |query_editor, cx| {
+            query_editor.set_placeholder_text("Search…", window, cx);
+        });
+
         Self {
             query_editor,
             query_editor_focused: false,
@@ -832,6 +837,8 @@ impl BufferSearchBar {
             is_collapsed: false,
             splittable_editor: None,
             _splittable_editor_subscription: None,
+            cached_needs_expand: None,
+            cached_supported_options: None,
         }
     }
 
@@ -950,7 +957,12 @@ impl BufferSearchBar {
         self.search_options.remove(SearchOptions::BACKWARDS);
 
         self.dismissed = false;
-        self.adjust_query_regex_language(cx);
+
+        // Defer language adjustment to after UI appears for faster initial render
+        cx.defer(|this, cx| {
+            this.adjust_query_regex_language(cx);
+        });
+
         handle.search_bar_visibility_changed(true, window, cx);
         cx.notify();
         cx.emit(Event::UpdateLocation);
@@ -964,30 +976,45 @@ impl BufferSearchBar {
         true
     }
 
-    fn supported_options(&self, cx: &mut Context<Self>) -> workspace::searchable::SearchOptions {
-        self.active_searchable_item
+    fn supported_options(&mut self, cx: &mut Context<Self>) -> workspace::searchable::SearchOptions {
+        if let Some(cached) = self.cached_supported_options {
+            return cached;
+        }
+
+        let result = self
+            .active_searchable_item
             .as_ref()
             .map(|item| item.supported_options(cx))
-            .unwrap_or_default()
+            .unwrap_or_default();
+
+        self.cached_supported_options = Some(result);
+        result
     }
 
     // We provide an expand/collapse button if we are in a multibuffer
     // and not doing a project search.
-    fn needs_expand_collapse_option(&self, cx: &App) -> bool {
-        if let Some(item) = &self.active_searchable_item {
+    fn needs_expand_collapse_option(&mut self, cx: &App) -> bool {
+        if let Some(cached) = self.cached_needs_expand {
+            return cached;
+        }
+
+        let result = if let Some(item) = &self.active_searchable_item {
             let buffer_kind = item.buffer_kind(cx);
 
             if buffer_kind == ItemBufferKind::Singleton {
-                return false;
+                false
+            } else {
+                let workspace::searchable::SearchOptions {
+                    find_in_results, ..
+                } = item.supported_options(cx);
+                !find_in_results
             }
-
-            let workspace::searchable::SearchOptions {
-                find_in_results, ..
-            } = item.supported_options(cx);
-            !find_in_results
         } else {
             false
-        }
+        };
+
+        self.cached_needs_expand = Some(result);
+        result
     }
 
     fn toggle_fold_all(&mut self, _: &ToggleFoldAll, window: &mut Window, cx: &mut Context<Self>) {
