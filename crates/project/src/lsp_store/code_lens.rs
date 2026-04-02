@@ -7,7 +7,7 @@ use futures::{
     FutureExt as _,
     future::{Shared, join_all},
 };
-use gpui::{AppContext as _, AsyncApp, Context, Entity, Task};
+use gpui::{AsyncApp, Context, Entity, Task};
 use language::Buffer;
 use lsp::LanguageServerId;
 use rpc::{TypedEnvelope, proto};
@@ -194,10 +194,42 @@ impl LspStore {
                 Ok(Some(code_lens_actions))
             })
         } else {
+            let request_timeout = ProjectSettings::get_global(cx)
+                .global_lsp_settings
+                .get_request_timeout();
             let code_lens_actions_task =
                 self.request_multiple_lsp_locally(buffer, None::<usize>, GetCodeLens, cx);
-            cx.background_spawn(async move {
-                Ok(Some(code_lens_actions_task.await.into_iter().collect()))
+            cx.spawn(async move |lsp_store, cx| {
+                let result = code_lens_actions_task.await;
+                if result.is_empty() {
+                    return Ok(None);
+                }
+
+                let mut resolved_result: HashMap<LanguageServerId, Vec<CodeAction>> =
+                    HashMap::default();
+                for (server_id, mut actions) in result {
+                    let language_server = lsp_store.update(cx, |lsp_store, _| {
+                        lsp_store
+                            .as_local()
+                            .and_then(|local| local.language_server_for_id(server_id))
+                    })?;
+
+                    if let Some(language_server) = language_server {
+                        for action in &mut actions {
+                            if let Err(e) = super::LocalLspStore::try_resolve_code_action(
+                                &language_server,
+                                action,
+                                request_timeout,
+                            )
+                            .await
+                            {
+                                log::warn!("Failed to resolve code lens: {e:#}");
+                            }
+                        }
+                    }
+                    resolved_result.insert(server_id, actions);
+                }
+                Ok(Some(resolved_result))
             })
         }
     }
