@@ -869,7 +869,7 @@ pub struct DragAndDropSelectionContent {
 pub struct CodeLensContent {
     /// Whether code lens is enabled.
     ///
-    /// Default: true
+    /// Default: false
     pub enabled: Option<bool>,
 
     /// The debounce delay before querying code lens from the language server.

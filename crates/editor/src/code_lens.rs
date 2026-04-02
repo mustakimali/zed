@@ -3,6 +3,7 @@ use gpui::{SharedString, Task, WeakEntity};
 use language::BufferId;
 use multi_buffer::{Anchor, MultiBufferRow, MultiBufferSnapshot, ToPoint as _};
 use project::CodeAction;
+use settings::Settings as _;
 use ui::{Context, Window, div, prelude::*};
 use workspace::{Toast, notifications::NotificationId};
 
@@ -77,11 +78,11 @@ impl CodeLensCache {
         self.block_ids.get(buffer_id)
     }
 
-    #[allow(dead_code)]
-    pub fn remove_buffer(&mut self, buffer_id: &BufferId) {
-        self.lenses.remove(buffer_id);
-        self.pending_refresh.remove(buffer_id);
-        self.block_ids.remove(buffer_id);
+    pub fn all_block_ids(&self) -> Vec<CustomBlockId> {
+        self.block_ids
+            .values()
+            .flat_map(|ids| ids.iter().copied())
+            .collect()
     }
 
     pub fn set_refresh_task(&mut self, buffer_id: BufferId, task: Task<()>) {
@@ -112,8 +113,7 @@ fn group_lenses_by_row(
         .into_iter()
         .map(|(row, (symbol_position, items))| {
             let indent = snapshot.indent_size_for_line(MultiBufferRow(row));
-            let position =
-                snapshot.anchor_at(text::Point::new(row, indent.len), text::Bias::Left);
+            let position = snapshot.anchor_at(text::Point::new(row, indent.len), text::Bias::Left);
             CodeLensData {
                 position,
                 symbol_position,
@@ -184,7 +184,7 @@ fn render_code_lens_line(
                         move |_event, window, cx| {
                             let kind = detect_lens_kind(&text);
                             if let Some(editor) = editor_clone.upgrade() {
-                                _ = editor.update(cx, |editor, cx| {
+                                editor.update(cx, |editor, cx| {
                                     editor.change_selections(
                                         SelectionEffects::default(),
                                         window,
@@ -262,36 +262,41 @@ impl Editor {
         self.code_lens_cache.enabled()
     }
 
-    pub fn refresh_code_lenses(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<Task<()>> {
+    pub fn refresh_code_lenses(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.code_lens_enabled() {
-            return None;
+            return;
         }
 
         let buffer = self.buffer().read(cx);
         let excerpt_buffer = match buffer.as_singleton() {
             Some(b) => b,
-            None => return None,
+            None => return,
         };
         let buffer_id = excerpt_buffer.read(cx).remote_id();
         let excerpt_buffer = excerpt_buffer.clone();
 
         let Some(project) = self.project.clone() else {
-            return None;
+            return;
         };
 
+        let debounce = crate::EditorSettings::get_global(cx).code_lens.debounce.0;
         let text_range = text::Anchor::MIN..text::Anchor::MAX;
         let multibuffer = self.buffer().clone();
 
         let task = cx.spawn_in(window, async move |editor, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(debounce))
+                .await;
+
             let actions_task = project.update(cx, |project, cx| {
                 project.code_lens_actions::<text::Anchor>(&excerpt_buffer, text_range.clone(), cx)
             });
 
             let actions: anyhow::Result<Option<Vec<CodeAction>>> = actions_task.await;
+
+            if let Err(e) = &actions {
+                log::error!("Failed to fetch code lens actions: {e:#}");
+            }
 
             if let Ok(Some(actions)) = actions {
                 let lenses = multibuffer.update(cx, |multibuffer, cx| {
@@ -331,7 +336,7 @@ impl Editor {
                     group_lenses_by_row(individual_lenses, &snapshot)
                 });
 
-                if let Err(_) = editor.update(cx, |editor, cx| {
+                if let Err(e) = editor.update(cx, |editor, cx| {
                     if !editor.code_lens_cache.enabled() {
                         return;
                     }
@@ -378,19 +383,27 @@ impl Editor {
                             editor.code_lens_cache.remove_refresh_task(&buffer_id);
                         })
                         .ok();
+                    log::error!("Failed to update code lens blocks: {e:#}");
                     return;
                 }
             }
 
             editor
-                .update(cx, |editor, _cx| {
+                .update(cx, |editor, cx| {
                     editor.code_lens_cache.remove_refresh_task(&buffer_id);
+                    if let Some(workspace) = editor.workspace() {
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.dismiss_notification(
+                                &NotificationId::unique::<CodeLensToast>(),
+                                cx,
+                            );
+                        });
+                    }
                 })
                 .ok();
         });
 
         self.code_lens_cache.set_refresh_task(buffer_id, task);
-        None
     }
 
     pub fn toggle_code_lenses(
@@ -415,26 +428,17 @@ impl Editor {
                 });
             }
         } else {
-            let all_block_ids: Vec<CustomBlockId> = self
-                .code_lens_cache
-                .block_ids
-                .values()
-                .flat_map(|ids| ids.iter().copied())
-                .collect();
+            let all_block_ids = self.code_lens_cache.all_block_ids();
             self.code_lens_cache.toggle(enabled);
             if !all_block_ids.is_empty() {
                 self.remove_blocks(all_block_ids.into_iter().collect(), None, cx);
             }
             if let Some(workspace) = self.workspace() {
                 workspace.update(cx, |workspace, cx| {
-                    workspace.dismiss_notification(
-                        &NotificationId::unique::<CodeLensToast>(),
-                        cx,
-                    );
+                    workspace.dismiss_notification(&NotificationId::unique::<CodeLensToast>(), cx);
                 });
             }
         }
         cx.notify();
     }
-
 }
