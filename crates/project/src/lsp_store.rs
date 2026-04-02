@@ -1083,6 +1083,7 @@ impl LocalLspStore {
                     let mut cx = cx.clone();
                     async move {
                         this.update(&mut cx, |this, cx| {
+                            this.invalidate_code_lens_cache_for_server(server_id);
                             cx.emit(LspStoreEvent::RefreshCodeLens);
                             this.downstream_client.as_ref().map(|(client, project_id)| {
                                 client.send(proto::RefreshCodeLens {
@@ -10186,13 +10187,15 @@ impl LspStore {
         cx: &mut Context<Self>,
     ) {
         if let Some(status) = self.language_server_statuses.get_mut(&language_server_id) {
-            if let Some(work) = status.pending_work.remove(&token)
-                && !work.is_disk_based_diagnostics_progress
-            {
-                cx.emit(LspStoreEvent::RefreshInlayHints {
-                    server_id: language_server_id,
-                    request_id: None,
-                });
+            if let Some(work) = status.pending_work.remove(&token) {
+                if !work.is_disk_based_diagnostics_progress {
+                    self.invalidate_code_lens_cache_for_server(language_server_id);
+                    cx.emit(LspStoreEvent::RefreshInlayHints {
+                        server_id: language_server_id,
+                        request_id: None,
+                    });
+                    cx.emit(LspStoreEvent::RefreshCodeLens);
+                }
             }
             cx.notify();
         }
@@ -13214,6 +13217,18 @@ impl LspStore {
             lsp_data.semantic_tokens = semantic_tokens;
         }
         lsp_data
+    }
+
+    fn invalidate_code_lens_cache_for_server(&mut self, server_id: LanguageServerId) {
+        for lsp_data in self.lsp_data.values_mut() {
+            if let Some(code_lens) = &mut lsp_data.code_lens {
+                if code_lens.lens.remove(&server_id).is_some() {
+                    if code_lens.lens.is_empty() {
+                        lsp_data.code_lens = None;
+                    }
+                }
+            }
+        }
     }
 }
 
